@@ -13,8 +13,7 @@ dist/
 .DS_Store
 Thumbs.db
 
-# foguocr (lib Rust), biblioteca gerada e modelos baixados (models/) e saídas
+# foguocr (lib Rust), modelos baixados (models/) e saídas
 foguocr/target/
-native/
 models/
 out/
