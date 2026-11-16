@@ -1,0 +1,305 @@
+// ocr.fg — OCR (imagem -> texto) para Fogu, sobre a lib Rust foguocr via
+// fogu:ffi. Rust puro: ocrs (detecção e reconhecimento de texto) sobre o
+// runtime rten, sem Tesseract nem dependências de sistema. Os dois modelos
+// (ONNX, ~10 MB) são baixados uma vez para models/ com download().
+//
+// Reconhece texto impresso no alfabeto latino sem acentos (o alfabeto do
+// modelo é ASCII: "ê" sai como "?" ou "e"), em fotos, capturas de tela e
+// documentos digitalizados; devolve as linhas em ordem de leitura, com
+// caixas (e palavras/caracteres se pedido).
+//
+// O reconhecimento roda em thread própria na lib e o Fogu espera em fatias
+// (sem travar as outras tarefas fg); os eventos chegam por callback
+// (ffi.callback, Fogu 0.7+). Veja README.md.
+import { Native, Pump, ms, mem } from "./_native.fg"
+import json from "fogu:json"
+import time from "fogu:time"
+
+const _native = new Native("ocr", "foguocr", "foc", {
+    foc_version: [["buffer", "i64"], "i64"],
+    foc_last_error: [["buffer", "i64"], "i64"],
+    foc_set_sink: [["ptr"], "i32"],
+    foc_models: [["str", "buffer", "i64"], "i64"],
+    foc_download: [["str"], "i64"],
+    foc_load: [["str"], "i64"],
+    foc_engine_info: [["i64", "buffer", "i64"], "i64"],
+    foc_recognize_file: [["i64", "str", "str"], "i64"],
+    foc_recognize_bytes: [["i64", "buffer", "i64", "str"], "i64"],
+    foc_recognize_raw: [["i64", "buffer", "i64", "i64", "i64", "i64", "str"], "i64"],
+    foc_dispatch: [["i64", "i64", "i64", "ptr"], "i64"],
+    foc_result: [["i64", "buffer", "i64"], "i64"],
+    foc_cancel: [["i64"], "i32"],
+    foc_close: [["i64"], "i32"],
+}, "FOGU_OCR_LIB")
+const _f = _native.api
+
+// No import: reconhece o sistema e a arquitetura e já carrega o binário
+// certo (native/<so>-<arch>/...). Se faltar, o erro volta na primeira chamada.
+_native.autoload()
+
+let _default = nil
+
+// O que foi detectado e carregado: { platform, os, file, path, loaded, error }.
+export fn nativeInfo() { return _native.info() }
+
+// Carrega a biblioteca nativa (native/<plataforma>/foguocr, native/foguocr,
+// o build do cargo, ou FOGU_OCR_LIB). `path` força um arquivo ou pasta.
+export fn load(path = nil) {
+    return _native.load(path)
+}
+
+// Caminho da lib carregada (nil antes de load()).
+export fn libraryPath() { return _native.path }
+
+export fn version() {
+    load()?
+    return _native.text((b, n) => _f.foc_version(b, n))
+}
+
+fn _status(rc) { return _native.status(rc) }
+
+// ---- modelos ---------------------------------------------------------------
+
+// { dir, detection, recognition, ready, urls } — os modelos estão em `dir`
+// (padrão: FOGU_OCR_MODELS ou models/)?
+export fn models(dir = "") {
+    load()?
+    return _native.json((b, n) => _f.foc_models(str(dir), b, n))
+}
+
+// Os modelos já estão baixados?
+export fn ready(dir = "") {
+    const m = models(dir)?
+    return m.ready, nil
+}
+
+// ---- jobs ------------------------------------------------------------------
+
+// Um trabalho da lib (baixar, reconhecer) rodando em thread própria.
+export struct Job {
+    handle = 0
+    kind = ""
+    done = nil
+    onEvent = nil
+    _pump = nil
+
+    new(handle, kind, onEvent = nil) {
+        this.handle = handle
+        this.kind = kind
+        this.onEvent = onEvent
+        this._pump = new Pump()
+    }
+
+    finished() { return this.done != nil }
+
+    // Até `max` eventos que chegarem em timeoutMs (duração ou ms; -1 = sem
+    // limite), esperando em fatias (as outras tarefas fg continuam rodando).
+    events(timeoutMs = 0, max = 64) {
+        if this.handle == 0 { return [], nil }
+        const h = this.handle
+        const evs = this._pump.wait(ms(timeoutMs),
+            (slice, cb) => _f.foc_dispatch(h, slice, max, cb),
+            () => _native.lastError(),
+            () => this.handle != 0)?
+        for ev in evs {
+            if ev["type"] == "done" { this.done = ev }
+        }
+        return evs, nil
+    }
+
+    // Espera o job terminar (até timeout; -1 = sem limite), entregando os
+    // eventos a onEvent(ev). Devolve o evento done.
+    wait(timeout = -1) {
+        const limit = ms(timeout)
+        const deadline = time.monotonic() + float(limit) / 1000.0
+        while this.done == nil {
+            const evs = this.events(200)?
+            if this.onEvent != nil {
+                for ev in evs { this.onEvent(ev) }
+            }
+            if limit >= 0 && this.done == nil && time.monotonic() >= deadline {
+                return nil, error(`ocr: ${this.kind} não terminou em ${limit} ms`)
+            }
+        }
+        return this.done, nil
+    }
+
+    // O evento done se o job já terminou, senão nil (não espera).
+    result() {
+        if this.done != nil { return this.done, nil }
+        const s = _native.text((b, n) => _f.foc_result(this.handle, b, n))?
+        if s == "" { return nil, nil }
+        this.done = json.parse(s)?
+        return this.done, nil
+    }
+
+    cancel() { return _status(_f.foc_cancel(this.handle)) }
+
+    close() {
+        if this.handle == 0 { return true, nil }
+        const rc = _f.foc_close(this.handle)
+        this.handle = 0
+        this._pump.close()
+        return _status(rc)
+    }
+}
+
+// Roda um job até o fim e devolve o done; em falha devolve o erro.
+fn _runJob(kind, handle, options) {
+    if handle < 0 { return nil, _native.lastError() }
+    const job = new Job(handle, kind, options.get("onEvent"))
+    const [done, err] = job.wait(options.get("wait") ?? -1)
+    job.close()
+    if err != nil { return nil, err }
+    if done.ok != true { return nil, error(`ocr: ${kind}: ${done.get("error") ?? "falhou"}`) }
+    return done, nil
+}
+
+// Baixa os modelos (os que faltam) para `dir` (padrão models/). options:
+// dir, baseUrl, force, timeout, onProgress(ev) com { file, bytes, total }.
+// Devolve { dir, files }.
+export fn download(options = {}) {
+    load()?
+    const o = {}
+    if options.has("dir") { o.dir = options.dir }
+    if options.has("baseUrl") { o.base_url = options.baseUrl }
+    if options.has("force") { o.force = options.force }
+    const timeout = options.get("timeout")
+    if timeout != nil { o.timeout_ms = ms(timeout) }
+    const onProgress = options.get("onProgress")
+    const onEvent = options.get("onEvent")
+    return _runJob("download", _f.foc_download(json.stringify(o)), { onEvent: (ev) => {
+        if ev["type"] == "progress" && onProgress != nil { onProgress(ev) }
+        if onEvent != nil { onEvent(ev) }
+    } })
+}
+
+// ---- motor -----------------------------------------------------------------
+
+// Opções de reconhecimento (camelCase ou snake_case) -> JSON da lib.
+fn _recOpts(options) {
+    const o = {}
+    const scale = options.get("scale")
+    if scale != nil { o.scale = float(scale) }
+    const mw = options.get("maxWidth") ?? options.get("max_width")
+    if mw != nil { o.max_width = mw }
+    for k in ["words", "chars", "corners"] {
+        if options.has(k) { o[k] = options[k] }
+    }
+    return json.stringify(o)
+}
+
+// Um motor de OCR com os modelos carregados (uma vez; reconhece quantas
+// imagens quiser). Veja ocr.load().
+export struct Engine {
+    handle = 0
+
+    new(handle) { this.handle = handle }
+
+    // { detection, recognition } — os arquivos de modelo em uso.
+    info() { return _native.json((b, n) => _f.foc_engine_info(this.handle, b, n)) }
+
+    // Inicia o reconhecimento sem esperar; devolve o Job. image: caminho de um
+    // arquivo (PNG, JPEG, BMP, GIF, WebP, TIFF), buffer/bytes de uma imagem
+    // codificada, ou uma imagem do fogu:image (codificada em PNG).
+    start(image, options = {}) {
+        const opts = _recOpts(options)
+        let handle = 0
+        const t = typeof(image)
+        if t == "str" {
+            handle = _f.foc_recognize_file(this.handle, image, opts)
+        } else if t == "buffer" || t == "list" {
+            const [m, n] = mem(image)
+            handle = _f.foc_recognize_bytes(this.handle, m, n, opts)
+        } else if t == "object" && image.width != nil {
+            const [m, n] = mem(image.encode("png"))
+            handle = _f.foc_recognize_bytes(this.handle, m, n, opts)
+        } else {
+            return nil, error(`ocr: imagem inválida (${t}); passe um caminho, bytes ou uma imagem do fogu:image`)
+        }
+        if handle < 0 { return nil, _native.lastError() }
+        return new Job(handle, "recognize", options.get("onEvent")), nil
+    }
+
+    // Reconhece e devolve { text, lines: [{ text, box: [x, y, w, h], words?,
+    // chars?, corners? }], width, height, scale, ms }. options:
+    //   scale      1.0 — redimensiona antes (2.0 ajuda em texto pequeno; 0.5 em imagens enormes)
+    //   maxWidth   0 — reduz imagens mais largas que isso
+    //   words      true: cada linha traz words [{ text, box }]
+    //   chars      true: cada linha traz chars [{ char, box }]
+    //   corners    true: os 4 cantos da caixa rotacionada de cada linha
+    //   timeout    espera máxima (padrão: sem limite)
+    recognize(image, options = {}) {
+        const job = this.start(image, options)?
+        const [done, err] = job.wait(options.get("timeout") ?? -1)
+        job.close()
+        if err != nil { return nil, err }
+        if done.ok != true { return nil, error(`ocr: ${done.get("error") ?? "falhou"}`) }
+        return done, nil
+    }
+
+    // Só o texto (linhas separadas por "\n").
+    text(image, options = {}) {
+        const r = this.recognize(image, options)?
+        return r.text, nil
+    }
+
+    // Pixels crus (sem codificar): data = bytes, channels = 1 (cinza), 3 (RGB) ou 4 (RGBA).
+    recognizeRaw(data, width, height, channels = 3, options = {}) {
+        const [m, n] = mem(data)
+        const handle = _f.foc_recognize_raw(this.handle, m, n, width, height, channels, _recOpts(options))
+        if handle < 0 { return nil, _native.lastError() }
+        const job = new Job(handle, "recognize", options.get("onEvent"))
+        const [done, err] = job.wait(options.get("timeout") ?? -1)
+        job.close()
+        if err != nil { return nil, err }
+        if done.ok != true { return nil, error(`ocr: ${done.get("error") ?? "falhou"}`) }
+        return done, nil
+    }
+
+    close() {
+        if this.handle == 0 { return true, nil }
+        const rc = _f.foc_close(this.handle)
+        this.handle = 0
+        if _default == this { _default = nil }
+        return _status(rc)
+    }
+}
+
+// Carrega os modelos e devolve um Engine. options: dir (models/), detection e
+// recognition (caminhos), beam (true ou largura: decodificação mais precisa e
+// mais lenta), alphabet, allowedChars (ex. "0123456789" para só dígitos),
+// download (true: baixa os modelos se faltarem).
+export fn load_engine(options = {}) {
+    load()?
+    const o = {}
+    for k in ["dir", "detection", "recognition", "beam", "alphabet", "debug"] {
+        if options.has(k) { o[k] = options[k] }
+    }
+    const allowed = options.get("allowedChars") ?? options.get("allowed_chars")
+    if allowed != nil { o.allowed_chars = allowed }
+    if options.get("download") == true {
+        const r = ready(options.get("dir") ?? "")?
+        if !r { download({ dir: options.get("dir") ?? "models", onProgress: options.get("onProgress") })? }
+    }
+    const handle = _f.foc_load(json.stringify(o))
+    if handle < 0 { return nil, _native.lastError() }
+    return new Engine(handle), nil
+}
+
+// O motor padrão (carregado na primeira vez, com as options dadas).
+export fn engine(options = {}) {
+    if _default == nil { _default = load_engine(options)? }
+    return _default, nil
+}
+
+// Atalhos com o motor padrão.
+export fn recognize(image, options = {}) {
+    const e = engine(options)?
+    return e.recognize(image, options)
+}
+
+export fn text(image, options = {}) {
+    const e = engine(options)?
+    return e.text(image, options)
+}

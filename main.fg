@@ -1,0 +1,62 @@
+// Exemplo: baixa os modelos (uma vez), gera uma imagem com texto usando o
+// fogu:image, reconhece o texto nela e numa imagem passada na linha de
+// comando, e mostra as linhas com as caixas.
+//   fogu run build:native && fogu run main.fg [imagem.png]
+import ocr from "./ocr.fg"
+import image from "fogu:image"
+import fs from "fogu:fs"
+
+fn main() {
+    print(`foguocr ${ocr.version()?}`)
+    if !ocr.ready()? {
+        print("baixando os modelos para models/ (~10 MB, uma vez)...")
+        let shown = -1
+        ocr.download({ onProgress: (ev) => {
+            if ev.total == 0 { return nil }
+            const pct = int(ev.bytes * 100 / ev.total)
+            // Uma linha a cada 25% (os eventos chegam a cada 256 KB).
+            if pct / 25 != shown || ev.bytes == ev.total {
+                shown = pct / 25
+                print(`  ${ev.file}: ${pct}% (${int(ev.bytes / 1024)} / ${int(ev.total / 1024)} KB)`)
+            }
+        } })?
+    }
+    const engine = ocr.load_engine()?
+
+    // Uma imagem com texto, gerada na hora.
+    fs.mkdir("out")
+    const img = image.new(640, 200, "white")
+    // Sem acentos: o alfabeto do modelo é ASCII ("lê" sairia como "l?").
+    img.text("Fogu le imagens", 24, 70, { size: 48, color: "black" })
+    img.text("Pedido 2026-11-10 total R$ 1.234,50", 24, 150, { size: 32, color: "#222" })
+    img.save("out/amostra.png")?
+
+    const r = engine.recognize("out/amostra.png", { words: true })?
+    print(`amostra (${r.width}x${r.height}, ${r.ms} ms):`)
+    for line in r.lines {
+        print(`  "${line.text}"  em x=${line.box[0]} y=${line.box[1]} ${line.box[2]}x${line.box[3]}`)
+        const words = line.words.map((w) => w.text)
+        print(`     palavras: ${words.join(" | ")}`)
+    }
+
+    // Direto de uma imagem do fogu:image (sem salvar) e só o texto.
+    print(`texto direto: ${engine.text(img)?}`)
+
+    // Só dígitos (allowedChars) — útil para números, códigos, placas.
+    const digits = ocr.load_engine({ allowedChars: "0123456789.,-" })?
+    print(`só dígitos: ${digits.text(img)?}`)
+    digits.close()?
+
+    // Uma imagem sua: fogu run main.fg foto.jpg
+    if len(Fogu.args) > 0 {
+        const path = Fogu.args[0]
+        const t = engine.recognize(path, { scale: 1.0 })?
+        print(`${path} (${t.width}x${t.height}, ${len(t.lines)} linhas, ${t.ms} ms):`)
+        print(t.text)
+    }
+    engine.close()?
+    return true, nil
+}
+
+const [_ok, err] = main()
+if err != nil { print(`erro: ${err.message}`) }

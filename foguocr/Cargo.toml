@@ -1,0 +1,20 @@
+[package]
+name = "foguocr"
+version = "0.1.0"
+edition = "2024"
+description = "OCR (imagem -> texto) em Rust puro (ocrs + rten) com API C para o fogu:ffi"
+
+[dependencies]
+ocrs = "0.14"
+rten = "0.28"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp", "tiff"] }
+serde_json = "1"
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier", "gzip"] }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

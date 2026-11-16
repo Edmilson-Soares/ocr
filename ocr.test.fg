@@ -1,0 +1,80 @@
+// Testes do ocr.fg. Precisam da lib nativa (fogu run build:native). Os que
+// reconhecem texto são pulados se os modelos não estiverem em models/
+// (ocr.download() os baixa; o teste não baixa nada sozinho).
+//   fogu test
+import { test, skip, expect } from "fogu:test"
+import ocr from "./ocr.fg"
+import image from "fogu:image"
+import fs from "fogu:fs"
+import path from "fogu:path"
+import time from "fogu:time"
+
+test("carrega a lib nativa", (): error => {
+    expect(ocr.version()?).toBe("0.1.0")
+    const m = ocr.models()?
+    expect(typeof(m.ready)).toBe("bool")
+    expect(len(m.urls)).toBe(2)
+    return nil
+})
+
+test("erros claros sem modelos ou sem imagem", (): error => {
+    const [_e, err] = ocr.load_engine({ dir: "nao-existe" })
+    expect(err.message).toContain("não encontrado")
+    expect(ocr.ready("nao-existe")?).toBe(false)
+    return nil
+})
+
+let withModels = skip
+if ocr.ready()? { withModels = test }
+
+withModels("reconhece texto gerado com fogu:image", (): error => {
+    const engine = ocr.load_engine()?
+    const info = engine.info()?
+    expect(info.detection.ends_with("text-detection.onnx")).toBe(true)
+
+    const img = image.new(600, 160, "white")
+    img.text("HELLO FOGU 2026", 20, 60, { size: 56, color: "black" })
+    img.text("segunda linha", 20, 130, { size: 36, color: "black" })
+    const dir = path.join(fs.tempDir(), `foguocr-${time.now()}`)
+    fs.mkdir(dir)
+    const file = path.join(dir, "t.png")
+    img.save(file)?
+
+    // Arquivo, com palavras e caixas.
+    const r = engine.recognize(file, { words: true, corners: true })?
+    expect(r.width).toBe(600)
+    expect(r.height).toBe(160)
+    expect(len(r.lines) >= 2).toBe(true)
+    expect(r.text.upper()).toContain("HELLO")
+    expect(r.text.upper()).toContain("FOGU")
+    expect(r.text.lower()).toContain("linha")
+    const first = r.lines[0]
+    expect(len(first.box)).toBe(4)
+    expect(first.box[1] < r.lines[1].box[1]).toBe(true)
+    expect(len(first.words) >= 3).toBe(true)
+    expect(len(first.corners)).toBe(4)
+
+    // Bytes e imagem do fogu:image, só texto.
+    const bytes = img.encode("png")
+    expect((engine.text(bytes)?).upper()).toContain("HELLO")
+    expect((engine.text(img)?).upper()).toContain("FOGU")
+
+    // Só dígitos.
+    const digits = ocr.load_engine({ allowedChars: "0123456789" })?
+    const d = digits.text(img)?
+    expect(d).toContain("2026")
+    expect(d.contains("HELLO")).toBe(false)
+    digits.close()?
+
+    // Job assíncrono.
+    const job = engine.start(file)?
+    const done = job.wait(60s)?
+    expect(done.ok).toBe(true)
+    job.close()?
+
+    const [_x, err] = engine.recognize(path.join(dir, "nao.png"))
+    expect(err.message).toContain("não encontrada")
+    engine.close()?
+    fs.removeAll(dir)
+    return nil
+})

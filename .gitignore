@@ -1,0 +1,20 @@
+# Fogu
+# Packages live in the global store (~/.fogu); fogu.lock pins them.
+# Remove the next line if you vendor packages into the project.
+fogu_modules/
+
+# build output and environment
+dist/
+.env
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# foguocr (lib Rust), biblioteca gerada e modelos baixados (models/) e saídas
+foguocr/target/
+native/
+models/
+out/
